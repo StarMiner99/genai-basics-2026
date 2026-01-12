@@ -67,6 +67,24 @@ function normalizeToRgba(data: Uint8Array | Uint8ClampedArray, width: number, he
   const expectedRgbLen = pixelCount * 3;
   const expectedGrayLen = pixelCount;
 
+  // Some PDFs expose 1-bit image masks as packed bits (length * 8 == pixelCount).
+  // If we treat that as bytes, most pixels become 0 -> solid black.
+  if (data.length * 8 === pixelCount) {
+    const out = new Uint8ClampedArray(expectedRgbaLen);
+    for (let p = 0; p < pixelCount; p++) {
+      const byteIndex = p >> 3;
+      const bitIndex = 7 - (p & 7);
+      const bit = ((data[byteIndex] ?? 0) >> bitIndex) & 1;
+      const v = bit ? 255 : 0;
+      const i = p * 4;
+      out[i] = v;
+      out[i + 1] = v;
+      out[i + 2] = v;
+      out[i + 3] = 255;
+    }
+    return out;
+  }
+
   if (data.length === expectedRgbaLen) {
     return data instanceof Uint8ClampedArray ? data : new Uint8ClampedArray(data);
   }
@@ -84,8 +102,15 @@ function normalizeToRgba(data: Uint8Array | Uint8ClampedArray, width: number, he
   }
 
   if (data.length === expectedGrayLen) {
-    for (let i = 0, j = 0; i < expectedRgbaLen && j < expectedGrayLen; i += 4, j += 1) {
+    let max = 0;
+    for (let j = 0; j < expectedGrayLen; j++) {
       const v = data[j] ?? 0;
+      if (v > max) max = v;
+      if (max > 1) break;
+    }
+    const scale = max <= 1 ? 255 : 1;
+    for (let i = 0, j = 0; i < expectedRgbaLen && j < expectedGrayLen; i += 4, j += 1) {
+      const v = (data[j] ?? 0) * scale;
       out[i] = v;
       out[i + 1] = v;
       out[i + 2] = v;
@@ -282,6 +307,69 @@ export class ImageExtractionService {
     }
 
     return pagesWithImages;
+  }
+
+  async extractImagesFromPdfPageRange(params: {
+    pdfBuffer: Buffer;
+    documentId: string;
+    startPage: number;
+    endPage: number;
+    includeVlmAnalysis: boolean;
+  }): Promise<{ pageNumber: number; images: Array<{ index: number; width: number; height: number; mimeType: string; buffer: Buffer }> }[]> {
+    const { pdfBuffer, documentId, startPage, endPage, includeVlmAnalysis } = params;
+    const pdfjs = await getPdfJs();
+    const data = new Uint8Array(pdfBuffer.buffer, pdfBuffer.byteOffset, pdfBuffer.byteLength);
+    const loadingTask = pdfjs.getDocument({ data });
+    const pdfDoc = await loadingTask.promise;
+
+    const totalPages = pdfDoc.numPages;
+    const from = Math.max(1, Math.min(startPage, totalPages));
+    const to = Math.max(from, Math.min(endPage, totalPages));
+
+    const results: {
+      pageNumber: number;
+      images: Array<{ index: number; width: number; height: number; mimeType: string; buffer: Buffer }>;
+    }[] = [];
+
+    for (let pageNum = from; pageNum <= to; pageNum++) {
+      const page = await pdfDoc.getPage(pageNum);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const operatorList = await page.getOperatorList();
+      const OPS = pdfjs.OPS;
+      const images: Array<{ index: number; width: number; height: number; mimeType: string; buffer: Buffer }> = [];
+
+      let imageIndex = 0;
+      for (let i = 0; i < operatorList.fnArray.length; i++) {
+        const op = operatorList.fnArray[i];
+        if (op === OPS.paintImageXObject || op === OPS.paintJpegXObject) {
+          const imageName = operatorList.argsArray[i][0];
+          const imageData = await this.getImageFromPage(page, imageName);
+          if (imageData) {
+            if (includeVlmAnalysis) {
+              await this.analyzeImage(imageData.buffer, imageData.mimeType, pageText);
+            }
+            images.push({
+              index: imageIndex,
+              width: imageData.width,
+              height: imageData.height,
+              mimeType: imageData.mimeType,
+              buffer: imageData.buffer,
+            });
+          }
+          imageIndex++;
+        }
+      }
+
+      results.push({ pageNumber: pageNum, images });
+    }
+
+    return results;
   }
 
   /**

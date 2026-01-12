@@ -11,6 +11,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { getDocumentIngestionService } from '../services/documentIngestionService.js';
+import { imageExtractionService } from '../services/imageExtractionService.js';
 import { imageStorageService } from '../services/imageStorageService.js';
 import { logInfo, logError } from '../utils/logger.js';
 import {
@@ -121,6 +122,87 @@ router.post('/upload', upload.array('files', 10), async (req: Request, res: Resp
       success: false,
       error: error instanceof Error ? error.message : String(error),
     });
+  }
+});
+
+router.post('/debug/extract-page-images', upload.single('file'), async (req: Request, res: Response) => {
+  const file = req.file as Express.Multer.File | undefined;
+  const startPage = parseInt(String((req.body as any)?.start_page ?? (req.query as any)?.start_page ?? ''), 10);
+  const endPage = parseInt(String((req.body as any)?.end_page ?? (req.query as any)?.end_page ?? ''), 10);
+  const page = parseInt(String((req.body as any)?.page ?? (req.query as any)?.page ?? ''), 10);
+  const includeVlm = String((req.body as any)?.include_vlm ?? (req.query as any)?.include_vlm ?? 'false').toLowerCase() === 'true';
+  const includeData = String((req.body as any)?.include_data ?? (req.query as any)?.include_data ?? 'true').toLowerCase() !== 'false';
+
+  if (!file) {
+    return res.status(400).json({
+      success: false,
+      error: 'No file provided (expected multipart field "file")',
+    });
+  }
+
+  const resolvedStart = Number.isFinite(page) ? page : (Number.isFinite(startPage) ? startPage : NaN);
+  const resolvedEnd = Number.isFinite(page) ? page : (Number.isFinite(endPage) ? endPage : resolvedStart);
+
+  if (!Number.isFinite(resolvedStart) || !Number.isFinite(resolvedEnd) || resolvedStart <= 0 || resolvedEnd <= 0) {
+    await fs.unlink(file.path).catch(() => {});
+    return res.status(400).json({
+      success: false,
+      error: 'Provide either "page" or "start_page" and optional "end_page" as positive integers',
+    });
+  }
+
+  try {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (ext !== '.pdf') {
+      return res.status(400).json({
+        success: false,
+        error: `Unsupported file type: ${ext || '(unknown)'} (expected .pdf)`,
+      });
+    }
+
+    const pdfBuffer = await fs.readFile(file.path);
+    const documentId = `debug_${Date.now()}`;
+    const extracted = await imageExtractionService.extractImagesFromPdfPageRange({
+      pdfBuffer,
+      documentId,
+      startPage: resolvedStart,
+      endPage: resolvedEnd,
+      includeVlmAnalysis: includeVlm,
+    });
+
+    const pages = extracted.map((p) => ({
+      page_number: p.pageNumber,
+      image_count: p.images.length,
+      images: p.images.map((img) => {
+        const base64 = includeData ? img.buffer.toString('base64') : undefined;
+        const data_url = includeData ? `data:${img.mimeType};base64,${base64}` : undefined;
+        return {
+          index: img.index,
+          width: img.width,
+          height: img.height,
+          mime_type: img.mimeType,
+          bytes: img.buffer.length,
+          data_url,
+        };
+      }),
+    }));
+
+    return res.status(200).json({
+      success: true,
+      start_page: resolvedStart,
+      end_page: resolvedEnd,
+      include_vlm: includeVlm,
+      include_data: includeData,
+      pages,
+    });
+  } catch (error) {
+    logError('Debug extract-page-images failed', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    await fs.unlink(file.path).catch(() => {});
   }
 });
 
@@ -390,7 +472,11 @@ router.get('/progress/:jobId/stream', (req: Request, res: Response) => {
  * Search for documents (also available as MCP tool for LLM)
  */
 router.post('/search', async (req: Request, res: Response) => {
-  const { query, k = 4, document_ids, document_names } = req.body as {
+  const defaultKRaw = process.env.DOC_SEARCH_TOP_K_DEFAULT;
+  const defaultKParsed = defaultKRaw ? parseInt(defaultKRaw, 10) : NaN;
+  const defaultK = Number.isFinite(defaultKParsed) && defaultKParsed > 0 ? defaultKParsed : 10;
+
+  const { query, k = defaultK, document_ids, document_names } = req.body as {
     query?: string;
     k?: number;
     document_ids?: string[];

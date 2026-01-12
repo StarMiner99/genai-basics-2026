@@ -27,6 +27,7 @@ export interface StoredImage {
 
 export class ImageStorageService {
   private hanaClient: any = null;
+  private hanaConnectPromise: Promise<void> | null = null;
   private readonly config: {
     hana: HanaConfig;
     imageTableName: string;
@@ -48,9 +49,8 @@ export class ImageStorageService {
    * Initialize HANA database connection
    */
   private async initHanaConnection(): Promise<void> {
-    if (this.hanaClient) {
-      return;
-    }
+    if (this.hanaClient) return;
+    if (this.hanaConnectPromise) return this.hanaConnectPromise;
 
     // Re-read env vars at connection time.
     // With ESM import hoisting, modules can be instantiated before dotenv config runs.
@@ -66,24 +66,107 @@ export class ImageStorageService {
       );
     }
 
-    return new Promise((resolve, reject) => {
-      this.hanaClient = hdb.createClient({
+    const connectTimeoutMs = parseInt(process.env.HANA_CONNECT_TIMEOUT_MS || '30000', 10);
+    const connectRetries = parseInt(process.env.HANA_CONNECT_RETRIES || '6', 10);
+    const connectRetryBaseDelayMs = parseInt(process.env.HANA_CONNECT_RETRY_DELAY_MS || '1000', 10);
+
+    const createClient = () =>
+      hdb.createClient({
         host,
         port,
         user,
         password,
+        connectTimeout: connectTimeoutMs,
+      } as any);
+
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    const connectOnce = (client: any) =>
+      new Promise<void>((resolve, reject) => {
+        let didFinish = false;
+        const timer = setTimeout(() => {
+          if (didFinish) return;
+          didFinish = true;
+          try {
+            client.disconnect(() => {});
+          } catch {
+            // ignore
+          }
+          reject(new Error(`HANA connect timed out after ${connectTimeoutMs}ms`));
+        }, connectTimeoutMs);
+
+        client.connect((err: Error) => {
+          if (didFinish) return;
+          didFinish = true;
+          clearTimeout(timer);
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
       });
 
-      this.hanaClient.connect((err: Error) => {
-        if (err) {
-          console.error('Failed to connect to HANA:', err);
-          reject(err);
-        } else {
+    this.hanaConnectPromise = (async () => {
+      let lastErr: any;
+      for (let attempt = 0; attempt <= connectRetries; attempt++) {
+        const client = createClient();
+        try {
+          await connectOnce(client);
+          this.hanaClient = client;
           console.log('✅ Image storage connected to HANA Cloud');
-          resolve();
+          return;
+        } catch (err) {
+          lastErr = err;
+          try {
+            client.disconnect(() => {});
+          } catch {
+            // ignore
+          }
+
+          const isLast = attempt === connectRetries;
+          if (isLast) break;
+
+          const delayMs = Math.min(connectRetryBaseDelayMs * Math.pow(2, attempt), 30000);
+          console.warn(
+            `Failed to connect to HANA for image storage (attempt ${attempt + 1}/${connectRetries + 1}). Retrying in ${delayMs}ms...`,
+            err,
+          );
+          await sleep(delayMs);
         }
-      });
+      }
+
+      console.error('Failed to connect to HANA:', lastErr);
+      throw lastErr;
+    })().finally(() => {
+      this.hanaConnectPromise = null;
     });
+
+    return this.hanaConnectPromise;
+  }
+
+  private resetHanaConnection(): void {
+    if (this.hanaClient) {
+      try {
+        this.hanaClient.disconnect(() => {});
+      } catch {
+        // ignore
+      }
+    }
+    this.hanaClient = null;
+    this.hanaConnectPromise = null;
+  }
+
+  private isTransientHanaError(err: any): boolean {
+    const msg = String(err?.message || err || '');
+    const code = String(err?.code || '');
+    return (
+      code === 'EHDBOPENCONN' ||
+      msg.includes('EHDBOPENCONN') ||
+      msg.includes('No initialization reply received') ||
+      msg.toLowerCase().includes('socket hang up') ||
+      msg.toLowerCase().includes('timeout')
+    );
   }
 
   /**
@@ -282,39 +365,63 @@ export class ImageStorageService {
    * Execute SQL query on HANA
    */
   private async executeSQL(sql: string, params: any[] = []): Promise<any> {
-    return new Promise((resolve, reject) => {
-      this.hanaClient.exec(sql, params, (err: Error, rows: any) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(rows);
-        }
+    const run = () =>
+      new Promise((resolve, reject) => {
+        this.hanaClient.exec(sql, params, (err: Error, rows: any) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(rows);
+          }
+        });
       });
-    });
+
+    try {
+      return await run();
+    } catch (err) {
+      if (this.isTransientHanaError(err)) {
+        this.resetHanaConnection();
+        await this.initHanaConnection();
+        return await run();
+      }
+      throw err;
+    }
   }
 
   /**
    * Execute prepared SQL statement on HANA
    */
   private async executePreparedSQL(sql: string, params: any[]): Promise<any> {
-    return new Promise((resolve, reject) => {
-      this.hanaClient.prepare(sql, (prepareErr: Error, statement: any) => {
-        if (prepareErr) {
-          reject(prepareErr);
-          return;
-        }
-
-        statement.exec(params, (execErr: Error, rows: any) => {
-          statement.drop(() => {});
-
-          if (execErr) {
-            reject(execErr);
-          } else {
-            resolve(rows);
+    const run = () =>
+      new Promise((resolve, reject) => {
+        this.hanaClient.prepare(sql, (prepareErr: Error, statement: any) => {
+          if (prepareErr) {
+            reject(prepareErr);
+            return;
           }
+
+          statement.exec(params, (execErr: Error, rows: any) => {
+            statement.drop(() => {});
+
+            if (execErr) {
+              reject(execErr);
+            } else {
+              resolve(rows);
+            }
+          });
         });
       });
-    });
+
+    try {
+      return await run();
+    } catch (err) {
+      if (this.isTransientHanaError(err)) {
+        this.resetHanaConnection();
+        await this.initHanaConnection();
+        return await run();
+      }
+      throw err;
+    }
   }
 }
 

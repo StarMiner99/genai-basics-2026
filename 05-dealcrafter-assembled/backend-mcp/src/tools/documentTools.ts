@@ -16,6 +16,12 @@ import { logInfo } from '../utils/logger.js';
  */
 export function registerDocumentSearchTool(server: McpServer): void {
 
+  function getDefaultTopK(): number {
+    const raw = process.env.DOC_SEARCH_TOP_K_DEFAULT;
+    const n = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : 10;
+  }
+
   // 1) Header-level document search: operate only on summaries in the header table
   //    Returns document metadata including document_id, title, and summary.
   server.tool(
@@ -90,8 +96,7 @@ export function registerDocumentSearchTool(server: McpServer): void {
       k: z
         .number()
         .optional()
-        .default(4)
-        .describe('Number of chunks to return (default: 4)'),
+        .describe('Number of chunks to return (default: DOC_SEARCH_TOP_K_DEFAULT or 10)'),
       document_ids: z
         .array(z.string())
         .optional()
@@ -102,8 +107,9 @@ export function registerDocumentSearchTool(server: McpServer): void {
         .describe('Optional list of document names (filenames) to restrict the search when IDs are not available'),
     },
     async ({ query, k, document_ids, document_names }) => {
+      const resolvedK = k ?? getDefaultTopK();
       logInfo(
-        `Tool: search_document_content | query: ${query}, k: ${k}, document_ids=${
+        `Tool: search_document_content | query: ${query}, k: ${resolvedK}, document_ids=${
           Array.isArray(document_ids) ? document_ids.join(',') : '[]'
         }, document_names=${Array.isArray(document_names) ? document_names.join(',') : '[]'}`,
       );
@@ -111,7 +117,7 @@ export function registerDocumentSearchTool(server: McpServer): void {
       try {
         const service = getDocumentIngestionService();
         const tenantId = service.getDefaultTenantId();
-        const results = await service.searchDocuments(query, tenantId, k, document_ids, document_names);
+        const results = await service.searchDocuments(query, tenantId, resolvedK, document_ids, document_names);
 
         const formattedResults = results.map((doc, idx) => ({
           rank: idx + 1,
