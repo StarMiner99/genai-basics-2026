@@ -457,22 +457,22 @@ export function DocumentManagement() {
           headerRow={
             <TableHeaderRow>
               <TableHeaderCell width="30%">
-                <Label wrapping>Title & File</Label>
+                <Label>Title & File</Label>
               </TableHeaderCell>
               <TableHeaderCell width="44%">
-                <Label wrapping>Summary</Label>
+                <Label>Summary</Label>
               </TableHeaderCell>
               <TableHeaderCell width="6rem" style={{ textAlign: 'center' }}>
-                <Label wrapping>Pages</Label>
+                <Label>Pages</Label>
               </TableHeaderCell>
               <TableHeaderCell width="6rem" style={{ textAlign: 'center' }}>
-                <Label wrapping>Chunks</Label>
+                <Label>Chunks</Label>
               </TableHeaderCell>
               <TableHeaderCell width="11rem">
-                <Label wrapping>Created</Label>
+                <Label>Created</Label>
               </TableHeaderCell>
               <TableHeaderCell width="4rem" style={{ textAlign: 'center', minWidth: '3.5rem' }}>
-                <Label wrapping>Actions</Label>
+                <Label>Actions</Label>
               </TableHeaderCell>
             </TableHeaderRow>
           }

@@ -20,3 +20,8 @@ deal_memo_*.md
 # IDE
 .vscode/
 .idea/
+
+# Nodejs
+node_modules/
+package-lock.json
+dist/

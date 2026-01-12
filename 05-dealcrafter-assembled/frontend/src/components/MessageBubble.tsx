@@ -1,15 +1,45 @@
 /**
  * Individual message bubble component.
  */
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { FlexBox, Text, Avatar, Button, Toast } from '@ui5/webcomponents-react';
 import '@ui5/webcomponents-icons/dist/copy.js';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { ChatMessage, TableData } from '../types/index';
 import { TableDisplay } from './TableDisplay';
 import './markdown.css';
+
+// Backend MCP server URL for serving images
+const MCP_API_URL = import.meta.env.VITE_MCP_API_URL || 'http://localhost:3001';
+
+/**
+ * Process message content to convert [IMAGE:imageId] markers to markdown images
+ * and handle image:imageId URL format from AI responses
+ */
+function processImageReferences(content: string): string {
+  if (!content) return content;
+  
+  // Convert [IMAGE:imageId]...[/IMAGE:imageId] blocks to markdown images
+  // The description is already in the text, so we just need to add the image
+  let processed = content.replace(
+    /\[IMAGE:([^\]]+)\]/g,
+    (_, imageId) => `\n\n![Document Image](${MCP_API_URL}/api/documents/images/${imageId})\n\n`
+  );
+  
+  // Remove closing tags
+  processed = processed.replace(/\[\/IMAGE:[^\]]+\]/g, '');
+  
+  // Also handle markdown image syntax with image:imageId URLs (from AI responses)
+  // e.g., ![caption](image:imageId) -> ![caption](http://localhost:3001/api/documents/images/imageId)
+  processed = processed.replace(
+    /!\[([^\]]*)\]\(image:([^)]+)\)/g,
+    (_, alt, imageId) => `![${alt}](${MCP_API_URL}/api/documents/images/${imageId})`
+  );
+  
+  return processed;
+}
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -21,6 +51,39 @@ export function MessageBubble({ message }: MessageBubbleProps) {
   const [toastMessage, setToastMessage] = useState('');
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [loadedImages, setLoadedImages] = useState<Set<string>>(new Set());
+
+  // Process message content to convert image references to actual URLs
+  const processedContent = useMemo(() => {
+    if (!message.content || isUser) return message.content;
+    return processImageReferences(message.content);
+  }, [message.content, isUser]);
+
+  // Custom components for ReactMarkdown to handle inline images
+  const markdownComponents: Components = useMemo(() => ({
+    img: ({ src, alt, ...props }) => {
+      // Check if this is a document image from our backend
+      const isDocumentImage = src?.includes('/api/documents/images/');
+      
+      return (
+        <img
+          src={src}
+          alt={alt || 'Document image'}
+          loading="lazy"
+          onClick={() => src && setPreviewImage(src)}
+          style={{
+            maxWidth: '100%',
+            maxHeight: isDocumentImage ? '400px' : '300px',
+            borderRadius: '0.5rem',
+            margin: '0.5rem 0',
+            cursor: 'pointer',
+            border: '1px solid var(--sapList_BorderColor)',
+            boxShadow: '0 2px 8px rgba(0, 0, 0, 0.1)',
+          }}
+          {...props}
+        />
+      );
+    },
+  }), []);
 
   const handleCopy = async () => {
     try {
@@ -82,8 +145,9 @@ export function MessageBubble({ message }: MessageBubbleProps) {
                   <ReactMarkdown 
                     remarkPlugins={[remarkGfm]}
                     rehypePlugins={[rehypeRaw]}
+                    components={markdownComponents}
                   >
-                    {message.content}
+                    {processedContent || ''}
                   </ReactMarkdown>
                 )}
               </div>

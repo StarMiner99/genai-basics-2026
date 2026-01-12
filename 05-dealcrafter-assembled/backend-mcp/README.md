@@ -5,6 +5,8 @@ This package hosts the TypeScript implementation of the backend Model Context Pr
 ## Features
 
 - **Document Ingestion Pipeline**: REST APIs to upload PDF/DOCX/TXT/MD files, view inventory, stream ingestion progress, and delete documents from HANA Cloud Vector Store
+- **Image Extraction**: Automatic extraction of images from PDFs with VLM-generated descriptions optimized for financial documents (charts, tables, graphs)
+- **Contextual Image Embedding**: Images are interleaved with surrounding text for better retrieval context
 - **MCP Tools**: Extensible tool system with automatic logging (document search exposed as MCP tool)
 - **Web Search**: Perplexity AI integration via SAP Generative AI Hub
 - **SAP AI SDK**: Automatic OAuth2 authentication and deployment resolution

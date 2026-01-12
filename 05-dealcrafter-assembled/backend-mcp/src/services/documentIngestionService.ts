@@ -14,6 +14,8 @@ import * as hdb from 'hdb';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { updateJob } from './ingestionJobManager.js';
+import { imageExtractionService, ExtractedImage } from './imageExtractionService.js';
+import { imageStorageService } from './imageStorageService.js';
 
 type MammothModule = {
   extractRawText: (options: { buffer: Buffer }) => Promise<{ value?: string }>;
@@ -129,12 +131,26 @@ export class DocumentIngestionService {
       return;
     }
 
+    // Re-read env vars at connection time.
+    // With ESM import hoisting, modules can be instantiated before dotenv config runs.
+    // Reading env vars here avoids capturing empty values.
+    const host = (process.env.HANA_DB_ADDRESS || this.config.hana.host || '').trim();
+    const user = (process.env.HANA_DB_USER || this.config.hana.user || '').trim();
+    const password = (process.env.HANA_DB_PASSWORD || this.config.hana.password || '').trim();
+    const port = parseInt(process.env.HANA_DB_PORT || String(this.config.hana.port || 443), 10);
+
+    if (!host || !user || !password) {
+      throw new Error(
+        `Missing HANA connection configuration. Please set HANA_DB_ADDRESS, HANA_DB_USER, and HANA_DB_PASSWORD in backend-mcp/.env.local (got host="${host}")`
+      );
+    }
+
     return new Promise((resolve, reject) => {
       this.hanaClient = hdb.createClient({
-        host: this.config.hana.host,
-        port: this.config.hana.port,
-        user: this.config.hana.user,
-        password: this.config.hana.password,
+        host,
+        port,
+        user,
+        password,
       });
 
       this.hanaClient.connect((err: Error) => {
@@ -193,24 +209,97 @@ export class DocumentIngestionService {
 
   /**
    * Load document from file path
+   * For PDFs, also extracts and returns images
    */
-  private async loadDocument(filePath: string): Promise<Document[]> {
+  private async loadDocumentWithImages(
+    filePath: string,
+    documentId?: string,
+    jobId?: string
+  ): Promise<{ documents: Document[]; images: ExtractedImage[] }> {
     const ext = path.extname(filePath).toLowerCase();
     switch (ext) {
       case '.pdf':
-        return this.loadPdfDocument(filePath);
+        return this.loadPdfDocument(filePath, documentId, jobId, true);
       case '.docx':
-        return this.loadDocxDocument(filePath);
+        return { documents: await this.loadDocxDocument(filePath), images: [] };
       default:
-        return this.loadTextDocument(filePath);
+        return { documents: await this.loadTextDocument(filePath), images: [] };
     }
   }
 
-  private async loadPdfDocument(filePath: string): Promise<Document[]> {
+  private async loadPdfDocument(
+    filePath: string,
+    documentId?: string,
+    jobId?: string,
+    extractImages: boolean = true
+  ): Promise<{ documents: Document[]; images: ExtractedImage[] }> {
     const buffer = await fs.readFile(filePath);
     const filename = path.basename(filePath);
+    const docId = documentId || path.parse(filePath).name;
 
-    // pdf-parse v2 uses class-based API
+    // Check if image extraction is enabled
+    const shouldExtractImages = extractImages && process.env.ENABLE_IMAGE_EXTRACTION !== 'false';
+
+    if (shouldExtractImages) {
+      // Use image extraction service for PDFs with images
+      try {
+        if (jobId) {
+          updateJob(jobId, {
+            stage: 'parsing',
+            message: 'Extracting text and images from PDF...',
+          });
+        }
+
+        const pagesWithImages = await imageExtractionService.extractImagesFromPdf(
+          buffer,
+          docId,
+          (msg) => {
+            if (jobId) {
+              updateJob(jobId, { message: msg });
+            }
+            console.log(`  📄 ${msg}`);
+          }
+        );
+
+        const totalPages = pagesWithImages.length;
+        const allImages: ExtractedImage[] = [];
+
+        // Create documents with interleaved image descriptions
+        const pageDocuments: Document[] = [];
+        for (const page of pagesWithImages) {
+          // Collect images for storage
+          allImages.push(...page.images);
+
+          // Use text with images interleaved
+          const content = page.textWithImages.trim();
+          if (!content) continue;
+
+          pageDocuments.push(
+            new Document({
+              pageContent: content,
+              metadata: {
+                source: filePath,
+                filename,
+                page_number: page.pageNumber,
+                total_pages: totalPages,
+                has_images: page.images.length > 0,
+                image_count: page.images.length,
+                image_ids: page.images.map((img) => img.imageId),
+              } as Record<string, any>,
+            })
+          );
+        }
+
+        if (pageDocuments.length > 0) {
+          console.log(`  ✅ Extracted ${pageDocuments.length} pages with ${allImages.length} images`);
+          return { documents: pageDocuments, images: allImages };
+        }
+      } catch (imgErr) {
+        console.warn('Image extraction failed, falling back to text-only:', imgErr);
+      }
+    }
+
+    // Fallback: text-only extraction using pdf-parse
     const { PDFParse } = await import('pdf-parse');
     const parser = new PDFParse({ data: buffer });
     
@@ -237,7 +326,7 @@ export class DocumentIngestionService {
         .filter((doc: Document) => doc.pageContent.length > 0);
 
       if (pageDocuments.length > 0) {
-        return pageDocuments;
+        return { documents: pageDocuments, images: [] };
       }
 
       const fallbackText = (textResult.text || '').trim();
@@ -245,17 +334,20 @@ export class DocumentIngestionService {
         throw new Error(`PDF document ${filename} did not contain extractable text`);
       }
 
-      return [
-        new Document({
-          pageContent: fallbackText,
-          metadata: {
-            source: filePath,
-            filename,
-            page_number: 1,
-            total_pages: 1,
-          },
-        }),
-      ];
+      return {
+        documents: [
+          new Document({
+            pageContent: fallbackText,
+            metadata: {
+              source: filePath,
+              filename,
+              page_number: 1,
+              total_pages: 1,
+            },
+          }),
+        ],
+        images: [],
+      };
     } finally {
       await parser.destroy();
     }
@@ -807,16 +899,38 @@ ${preview}
 
       const tenant = tenantId || this.config.defaultTenantId;
       const timestamp = new Date().toISOString();
+      const documentId = path.parse(filePath).name;
 
-      // Load document
-      const documents = await this.loadDocument(filePath);
+      // Load document with image extraction
+      const { documents, images } = await this.loadDocumentWithImages(filePath, documentId, jobId);
 
-      const totalPagesFromDocs = documents.reduce((max, doc) => {
+      // Store extracted images in HANA
+      if (images.length > 0) {
+        if (jobId) {
+          updateJob(jobId, {
+            stage: 'storing',
+            message: `Storing ${images.length} extracted images...`,
+          });
+        }
+        for (const img of images) {
+          await imageStorageService.storeImage({
+            imageId: img.imageId,
+            documentId,
+            pageNumber: img.pageNumber,
+            mimeType: img.mimeType,
+            width: img.width,
+            height: img.height,
+            description: img.description,
+            imageData: img.imageData,
+          });
+        }
+        console.log(`  ✅ Stored ${images.length} images in HANA`);
+      }
+
+      const totalPagesFromDocs = documents.reduce((max: number, doc: Document) => {
         const docTotalPages = Number((doc.metadata as Record<string, any>)?.total_pages) || 0;
         return Math.max(max, docTotalPages);
       }, documents.length || 1);
-
-      const documentId = path.parse(filePath).name;
       const fallbackSourceFilename = path.basename(filePath);
       const documentType = this.inferDocumentType(filePath);
 

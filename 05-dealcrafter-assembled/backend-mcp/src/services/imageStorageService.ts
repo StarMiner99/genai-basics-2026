@@ -1,0 +1,321 @@
+/**
+ * Image Storage Service for HANA Cloud
+ * 
+ * Stores extracted images in a HANA BLOB table and provides
+ * retrieval functionality for serving images via REST API.
+ */
+
+import * as hdb from 'hdb';
+
+interface HanaConfig {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+}
+
+export interface StoredImage {
+  imageId: string;
+  documentId: string;
+  pageNumber: number;
+  mimeType: string;
+  width: number;
+  height: number;
+  description: string;
+  createdAt: string;
+}
+
+export class ImageStorageService {
+  private hanaClient: any = null;
+  private readonly config: {
+    hana: HanaConfig;
+    imageTableName: string;
+  };
+
+  constructor() {
+    this.config = {
+      hana: {
+        host: process.env.HANA_DB_ADDRESS || '',
+        port: parseInt(process.env.HANA_DB_PORT || '443', 10),
+        user: process.env.HANA_DB_USER || '',
+        password: process.env.HANA_DB_PASSWORD || '',
+      },
+      imageTableName: process.env.HANA_IMAGE_TABLE || 'LANGCHAIN_DEMO_IMAGES',
+    };
+  }
+
+  /**
+   * Initialize HANA database connection
+   */
+  private async initHanaConnection(): Promise<void> {
+    if (this.hanaClient) {
+      return;
+    }
+
+    // Re-read env vars at connection time.
+    // With ESM import hoisting, modules can be instantiated before dotenv config runs.
+    // Reading env vars here avoids capturing empty values.
+    const host = (process.env.HANA_DB_ADDRESS || this.config.hana.host || '').trim();
+    const user = (process.env.HANA_DB_USER || this.config.hana.user || '').trim();
+    const password = (process.env.HANA_DB_PASSWORD || this.config.hana.password || '').trim();
+    const port = parseInt(process.env.HANA_DB_PORT || String(this.config.hana.port || 443), 10);
+
+    if (!host || !user || !password) {
+      throw new Error(
+        `Missing HANA connection configuration for image storage. Please set HANA_DB_ADDRESS, HANA_DB_USER, and HANA_DB_PASSWORD in backend-mcp/.env.local (got host="${host}")`
+      );
+    }
+
+    return new Promise((resolve, reject) => {
+      this.hanaClient = hdb.createClient({
+        host,
+        port,
+        user,
+        password,
+      });
+
+      this.hanaClient.connect((err: Error) => {
+        if (err) {
+          console.error('Failed to connect to HANA:', err);
+          reject(err);
+        } else {
+          console.log('✅ Image storage connected to HANA Cloud');
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Ensure the image table exists with the correct schema
+   */
+  async ensureImageTable(): Promise<void> {
+    await this.initHanaConnection();
+
+    try {
+      const checkSQL = `SELECT TOP 1 * FROM "${this.config.imageTableName}"`;
+      await this.executeSQL(checkSQL);
+      console.log(`✅ Image table ${this.config.imageTableName} exists`);
+    } catch (error: any) {
+      console.log(`Creating image table ${this.config.imageTableName}...`);
+
+      try {
+        await this.executeSQL(`DROP TABLE "${this.config.imageTableName}"`);
+        console.log(`Dropped existing image table ${this.config.imageTableName}`);
+      } catch (dropError) {
+        // Table doesn't exist, that's fine
+      }
+
+      const createTableSQL = `
+        CREATE TABLE "${this.config.imageTableName}" (
+          "image_id" NVARCHAR(255) PRIMARY KEY,
+          "document_id" NVARCHAR(255) NOT NULL,
+          "page_number" INTEGER NOT NULL,
+          "mime_type" NVARCHAR(64),
+          "width" INTEGER,
+          "height" INTEGER,
+          "description" NCLOB,
+          "image_data" BLOB,
+          "created_at" NVARCHAR(64)
+        )
+      `;
+      await this.executeSQL(createTableSQL);
+      console.log(`✅ Created image table ${this.config.imageTableName}`);
+    }
+  }
+
+  /**
+   * Store an image in HANA
+   */
+  async storeImage(params: {
+    imageId: string;
+    documentId: string;
+    pageNumber: number;
+    mimeType: string;
+    width: number;
+    height: number;
+    description: string;
+    imageData: Buffer;
+  }): Promise<void> {
+    await this.ensureImageTable();
+
+    const timestamp = new Date().toISOString();
+
+    // Delete existing image with same ID (upsert behavior)
+    const deleteSQL = `DELETE FROM "${this.config.imageTableName}" WHERE "image_id" = ?`;
+    await this.executePreparedSQL(deleteSQL, [params.imageId]);
+
+    const insertSQL = `
+      INSERT INTO "${this.config.imageTableName}"
+      ("image_id", "document_id", "page_number", "mime_type", "width", "height", "description", "image_data", "created_at")
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    await this.executePreparedSQL(insertSQL, [
+      params.imageId,
+      params.documentId,
+      params.pageNumber,
+      params.mimeType,
+      params.width,
+      params.height,
+      params.description,
+      params.imageData,
+      timestamp,
+    ]);
+
+    console.log(`✅ Stored image ${params.imageId} in HANA`);
+  }
+
+  /**
+   * Retrieve image data by ID
+   */
+  async getImage(imageId: string): Promise<{ data: Buffer; mimeType: string } | null> {
+    await this.initHanaConnection();
+
+    const sql = `
+      SELECT "image_data", "mime_type"
+      FROM "${this.config.imageTableName}"
+      WHERE "image_id" = ?
+    `;
+
+    try {
+      const rows = await this.executePreparedSQL(sql, [imageId]);
+      if (rows && rows.length > 0) {
+        const row = rows[0];
+        return {
+          data: row.IMAGE_DATA || row.image_data,
+          mimeType: row.MIME_TYPE || row.mime_type || 'image/png',
+        };
+      }
+      return null;
+    } catch (err) {
+      console.error(`Error retrieving image ${imageId}:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Get image metadata (without the binary data)
+   */
+  async getImageMetadata(imageId: string): Promise<StoredImage | null> {
+    await this.initHanaConnection();
+
+    const sql = `
+      SELECT "image_id", "document_id", "page_number", "mime_type", "width", "height", "description", "created_at"
+      FROM "${this.config.imageTableName}"
+      WHERE "image_id" = ?
+    `;
+
+    try {
+      const rows = await this.executePreparedSQL(sql, [imageId]);
+      if (rows && rows.length > 0) {
+        const row = rows[0];
+        return {
+          imageId: row.IMAGE_ID || row.image_id,
+          documentId: row.DOCUMENT_ID || row.document_id,
+          pageNumber: row.PAGE_NUMBER || row.page_number,
+          mimeType: row.MIME_TYPE || row.mime_type,
+          width: row.WIDTH || row.width,
+          height: row.HEIGHT || row.height,
+          description: row.DESCRIPTION || row.description,
+          createdAt: row.CREATED_AT || row.created_at,
+        };
+      }
+      return null;
+    } catch (err) {
+      console.error(`Error retrieving image metadata ${imageId}:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * List all images for a document
+   */
+  async listImagesForDocument(documentId: string): Promise<StoredImage[]> {
+    await this.initHanaConnection();
+
+    const sql = `
+      SELECT "image_id", "document_id", "page_number", "mime_type", "width", "height", "description", "created_at"
+      FROM "${this.config.imageTableName}"
+      WHERE "document_id" = ?
+      ORDER BY "page_number", "image_id"
+    `;
+
+    try {
+      const rows = await this.executePreparedSQL(sql, [documentId]);
+      return (rows || []).map((row: any) => ({
+        imageId: row.IMAGE_ID || row.image_id,
+        documentId: row.DOCUMENT_ID || row.document_id,
+        pageNumber: row.PAGE_NUMBER || row.page_number,
+        mimeType: row.MIME_TYPE || row.mime_type,
+        width: row.WIDTH || row.width,
+        height: row.HEIGHT || row.height,
+        description: row.DESCRIPTION || row.description,
+        createdAt: row.CREATED_AT || row.created_at,
+      }));
+    } catch (err) {
+      console.error(`Error listing images for document ${documentId}:`, err);
+      return [];
+    }
+  }
+
+  /**
+   * Delete all images for a document
+   */
+  async deleteImagesForDocument(documentId: string): Promise<number> {
+    await this.initHanaConnection();
+
+    const sql = `DELETE FROM "${this.config.imageTableName}" WHERE "document_id" = ?`;
+
+    try {
+      const result = await this.executePreparedSQL(sql, [documentId]);
+      const count = typeof result === 'number' ? result : 0;
+      console.log(`Deleted ${count} images for document ${documentId}`);
+      return count;
+    } catch (err) {
+      console.error(`Error deleting images for document ${documentId}:`, err);
+      return 0;
+    }
+  }
+
+  /**
+   * Execute SQL query on HANA
+   */
+  private async executeSQL(sql: string, params: any[] = []): Promise<any> {
+    return new Promise((resolve, reject) => {
+      this.hanaClient.exec(sql, params, (err: Error, rows: any) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(rows);
+        }
+      });
+    });
+  }
+
+  /**
+   * Execute prepared SQL statement on HANA
+   */
+  private async executePreparedSQL(sql: string, params: any[]): Promise<any> {
+    return new Promise((resolve, reject) => {
+      this.hanaClient.prepare(sql, (prepareErr: Error, statement: any) => {
+        if (prepareErr) {
+          reject(prepareErr);
+          return;
+        }
+
+        statement.exec(params, (execErr: Error, rows: any) => {
+          statement.drop(() => {});
+
+          if (execErr) {
+            reject(execErr);
+          } else {
+            resolve(rows);
+          }
+        });
+      });
+    });
+  }
+}
+
+export const imageStorageService = new ImageStorageService();

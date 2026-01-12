@@ -1,0 +1,511 @@
+/**
+ * Image Extraction Service for PDF Documents
+ * 
+ * Extracts images from PDF pages and generates VLM descriptions
+ * optimized for financial documents (charts, tables, graphs).
+ * 
+ * Images are interleaved into the text flow at their approximate positions.
+ */
+
+import { AzureOpenAiChatClient } from '@sap-ai-sdk/langchain';
+import { HumanMessage } from '@langchain/core/messages';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as crypto from 'crypto';
+
+// Lazy-load pdfjs-dist to avoid startup issues
+let pdfjsLib: any = null;
+
+async function getPdfJs() {
+  if (!pdfjsLib) {
+    // In Node.js, pdfjs-dist recommends using the legacy build.
+    // This also avoids runtime warnings and improves compatibility.
+    pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  }
+  return pdfjsLib;
+}
+
+export interface ExtractedImage {
+  imageId: string;
+  pageNumber: number;
+  imageData: Buffer;
+  mimeType: string;
+  width: number;
+  height: number;
+  description: string;
+}
+
+export interface PageWithImages {
+  pageNumber: number;
+  text: string;
+  textWithImages: string; // Text with image descriptions interleaved
+  images: ExtractedImage[];
+}
+
+const MIN_IMAGE_SIZE = 50; // Skip images smaller than 50x50 (likely icons/noise)
+
+// Test mode: limit number of pages to process for image extraction
+// Set MAX_IMAGE_PAGES in .env.local to limit (e.g., 3 for testing)
+// If not set or 0, all pages are processed
+const MAX_IMAGE_PAGES = parseInt(process.env.MAX_IMAGE_PAGES || '0', 10);
+
+/**
+ * Image analysis response structure
+ */
+interface ImageAnalysisResult {
+  description: string;
+  shouldEmbed: boolean;
+  reason: string;
+}
+
+/**
+ * Financial document-optimized VLM prompt for image description with embedding decision
+ * Returns JSON with description, shouldEmbed decision, and reason
+ */
+function buildImageAnalysisPrompt(surroundingText: string): string {
+  return `You are an expert financial analyst assistant. Analyze this image from a financial document (annual report, quarterly earnings, investor presentation, etc.).
+
+## Context
+This image appears near the following text in the document:
+---
+${surroundingText.slice(0, 1500)}
+---
+
+## Your Task
+1. Analyze the image and extract meaningful information
+2. Decide whether this image should be embedded in the document's knowledge base
+
+## Instructions by Image Type:
+
+### For Charts/Graphs (bar charts, line graphs, pie charts):
+- Identify the chart type and title
+- Extract ALL data points with their exact values
+- Note the axes labels, units, and time periods
+- Describe trends, comparisons, and key insights
+- Format numerical data in markdown tables when appropriate
+- **EMBED: YES** - Charts contain valuable data
+
+### For Tables:
+- Reproduce the ENTIRE table in markdown format
+- Preserve all column headers and row labels
+- Include all numerical values with their units
+- Note any footnotes or annotations
+- **EMBED: YES** - Tables contain valuable data
+
+### For Diagrams/Flowcharts:
+- Describe the structure and relationships
+- List all components and their connections
+- Explain the process or hierarchy shown
+- **EMBED: YES** if it shows business processes, org structure, or strategy
+- **EMBED: NO** if it's just decorative
+
+### For Photos/Images:
+- Describe what is shown
+- Note any text, logos, or identifiable elements
+- **EMBED: YES** if it shows products, facilities, executives, or relevant business content
+- **EMBED: NO** if it's stock photography, decorative, or generic
+
+### For Icons/Decorative Elements:
+- **EMBED: NO** - Skip icons, bullets, decorative borders, logos used as separators
+
+### For Infographics:
+- Extract all text and numerical data
+- Describe visual elements and their meaning
+- **EMBED: YES** if it contains unique data or insights
+
+## Output Format
+Respond with a JSON object (no markdown code blocks, just raw JSON):
+{
+  "description": "<detailed description of the image content, including all data, tables in markdown, etc.>",
+  "shouldEmbed": true or false,
+  "reason": "<brief explanation of why this image should or should not be embedded>"
+}
+
+Analyze the image now and respond with JSON only:`;
+}
+
+export class ImageExtractionService {
+  private visionClient: AzureOpenAiChatClient | null = null;
+  private readonly resourceGroup: string;
+  private readonly visionModel: string;
+
+  constructor() {
+    this.resourceGroup = process.env.SAP_AI_RESOURCE_GROUP || 'default';
+    this.visionModel = process.env.VISION_MODEL || 'gpt-4.1';
+  }
+
+  private getVisionClient(): AzureOpenAiChatClient {
+    if (!this.visionClient) {
+      console.log(`Initializing vision client with model: ${this.visionModel}`);
+      this.visionClient = new AzureOpenAiChatClient({
+        modelName: this.visionModel,
+        resourceGroup: this.resourceGroup,
+        temperature: 0.2,
+        max_tokens: 2048,
+      });
+    }
+    return this.visionClient;
+  }
+
+  /**
+   * Generate a unique image ID
+   */
+  private generateImageId(documentId: string, pageNumber: number, index: number): string {
+    const hash = crypto.createHash('md5')
+      .update(`${documentId}_${pageNumber}_${index}_${Date.now()}`)
+      .digest('hex')
+      .slice(0, 8);
+    return `${documentId}_p${pageNumber}_img${index}_${hash}`;
+  }
+
+  /**
+   * Extract images from a PDF buffer and generate descriptions
+   */
+  async extractImagesFromPdf(
+    pdfBuffer: Buffer,
+    documentId: string,
+    onProgress?: (message: string) => void
+  ): Promise<PageWithImages[]> {
+    const pdfjs = await getPdfJs();
+
+    // pdfjs-dist expects `Uint8Array` in Node environments (not a Buffer instance)
+    const data = new Uint8Array(pdfBuffer.buffer, pdfBuffer.byteOffset, pdfBuffer.byteLength);
+
+    // Load PDF document
+    const loadingTask = pdfjs.getDocument({ data });
+    const pdfDoc = await loadingTask.promise;
+    const totalPages = pdfDoc.numPages;
+
+    // Apply MAX_IMAGE_PAGES limit if set (for testing)
+    const pagesToProcess = MAX_IMAGE_PAGES > 0 ? Math.min(MAX_IMAGE_PAGES, totalPages) : totalPages;
+    
+    if (MAX_IMAGE_PAGES > 0 && totalPages > MAX_IMAGE_PAGES) {
+      onProgress?.(`⚠️ TEST MODE: Processing only ${pagesToProcess} of ${totalPages} pages for images (MAX_IMAGE_PAGES=${MAX_IMAGE_PAGES})`);
+      console.log(`⚠️ TEST MODE: Limiting image extraction to ${pagesToProcess} pages (MAX_IMAGE_PAGES=${MAX_IMAGE_PAGES})`);
+    } else {
+      onProgress?.(`Extracting images from ${pagesToProcess} pages...`);
+    }
+
+    const pagesWithImages: PageWithImages[] = [];
+
+    for (let pageNum = 1; pageNum <= pagesToProcess; pageNum++) {
+      onProgress?.(`Processing page ${pageNum}/${pagesToProcess}...`);
+      
+      const page = await pdfDoc.getPage(pageNum);
+      
+      // Get text content
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      // Extract images from page, passing surrounding text for context
+      const images = await this.extractImagesFromPage(page, documentId, pageNum, pageText, onProgress);
+
+      // Interleave image descriptions into text
+      const textWithImages = this.interleaveImagesIntoText(pageText, images);
+
+      pagesWithImages.push({
+        pageNumber: pageNum,
+        text: pageText,
+        textWithImages,
+        images,
+      });
+    }
+
+    // For remaining pages (beyond MAX_IMAGE_PAGES), just extract text without images
+    for (let pageNum = pagesToProcess + 1; pageNum <= totalPages; pageNum++) {
+      const page = await pdfDoc.getPage(pageNum);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      pagesWithImages.push({
+        pageNumber: pageNum,
+        text: pageText,
+        textWithImages: pageText, // No image processing for these pages
+        images: [],
+      });
+    }
+
+    return pagesWithImages;
+  }
+
+  /**
+   * Extract images from a single PDF page
+   */
+  private async extractImagesFromPage(
+    page: any,
+    documentId: string,
+    pageNumber: number,
+    surroundingText: string,
+    onProgress?: (message: string) => void
+  ): Promise<ExtractedImage[]> {
+    const images: ExtractedImage[] = [];
+    
+    try {
+      const operatorList = await page.getOperatorList();
+      const pdfjs = await getPdfJs();
+      const OPS = pdfjs.OPS;
+
+      let imageIndex = 0;
+      let skippedCount = 0;
+
+      for (let i = 0; i < operatorList.fnArray.length; i++) {
+        const op = operatorList.fnArray[i];
+        
+        // Check for image operations
+        if (op === OPS.paintImageXObject || op === OPS.paintJpegXObject) {
+          const imageName = operatorList.argsArray[i][0];
+          
+          try {
+            const imageData = await this.getImageFromPage(page, imageName);
+            
+            if (imageData && imageData.width >= MIN_IMAGE_SIZE && imageData.height >= MIN_IMAGE_SIZE) {
+              onProgress?.(`  Analyzing image ${imageIndex + 1} on page ${pageNumber}...`);
+              
+              // Generate VLM description with embedding decision
+              const analysis = await this.analyzeImage(imageData.buffer, imageData.mimeType, surroundingText);
+              
+              if (analysis.shouldEmbed) {
+                const imageId = this.generateImageId(documentId, pageNumber, imageIndex);
+                
+                onProgress?.(`  ✅ Embedding image ${imageIndex + 1}: ${analysis.reason}`);
+                
+                images.push({
+                  imageId,
+                  pageNumber,
+                  imageData: imageData.buffer,
+                  mimeType: imageData.mimeType,
+                  width: imageData.width,
+                  height: imageData.height,
+                  description: analysis.description,
+                });
+              } else {
+                skippedCount++;
+                onProgress?.(`  ⏭️ Skipping image ${imageIndex + 1}: ${analysis.reason}`);
+              }
+              
+              imageIndex++;
+            }
+          } catch (imgErr) {
+            console.warn(`Failed to extract image ${imageName} from page ${pageNumber}:`, imgErr);
+          }
+        }
+      }
+      
+      if (skippedCount > 0) {
+        console.log(`  Page ${pageNumber}: Skipped ${skippedCount} irrelevant images`);
+      }
+    } catch (err) {
+      console.warn(`Error extracting images from page ${pageNumber}:`, err);
+    }
+
+    return images;
+  }
+
+  /**
+   * Get image data from PDF page object
+   */
+  private async getImageFromPage(
+    page: any,
+    imageName: string
+  ): Promise<{ buffer: Buffer; mimeType: string; width: number; height: number } | null> {
+    try {
+      const objs = page.objs;
+      
+      // Try to get the image object
+      const imgObj = await new Promise<any>((resolve) => {
+        if (objs.get.length >= 2) {
+          // Callback-based API
+          objs.get(imageName, (data: any) => resolve(data ?? null));
+        } else {
+          // Direct API
+          try {
+            resolve(objs.get(imageName));
+          } catch {
+            resolve(null);
+          }
+        }
+      });
+
+      if (!imgObj) return null;
+
+      const width = imgObj.width;
+      const height = imgObj.height;
+      
+      if (!width || !height) return null;
+
+      // Convert image data to PNG buffer
+      let buffer: Buffer;
+      let mimeType = 'image/png';
+
+      if (imgObj.data) {
+        // Raw image data - need to convert to PNG
+        // For simplicity, we'll create a basic PNG from RGBA data
+        buffer = await this.createPngFromRgba(imgObj.data, width, height);
+      } else if (imgObj.src) {
+        // Already encoded (JPEG, etc.)
+        if (typeof imgObj.src === 'string' && imgObj.src.startsWith('data:')) {
+          const base64Data = imgObj.src.split(',')[1];
+          buffer = Buffer.from(base64Data, 'base64');
+          mimeType = imgObj.src.split(';')[0].split(':')[1] || 'image/png';
+        } else {
+          buffer = Buffer.from(imgObj.src);
+        }
+      } else {
+        return null;
+      }
+
+      return { buffer, mimeType, width, height };
+    } catch (err) {
+      console.warn(`Error getting image ${imageName}:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Create a simple PNG from RGBA data
+   * Note: This is a simplified implementation. For production, consider using sharp or canvas.
+   */
+  private async createPngFromRgba(data: Uint8ClampedArray, width: number, height: number): Promise<Buffer> {
+    // For now, we'll use a simple approach - just store as raw data
+    // In production, you'd want to use a proper image library like sharp
+    
+    // Try to use canvas if available
+    try {
+      const { createCanvas } = await import('@napi-rs/canvas');
+      const canvas = createCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      const imageData = ctx.createImageData(width, height);
+      
+      // Copy data
+      for (let i = 0; i < data.length; i++) {
+        imageData.data[i] = data[i];
+      }
+      
+      ctx.putImageData(imageData, 0, 0);
+      return canvas.toBuffer('image/png');
+    } catch {
+      // Fallback: return raw data as buffer (won't be a valid image but can be stored)
+      console.warn('Canvas not available, storing raw image data');
+      return Buffer.from(data);
+    }
+  }
+
+  /**
+   * Analyze an image using the vision model - returns description + embedding decision
+   */
+  async analyzeImage(imageBuffer: Buffer, mimeType: string, surroundingText: string): Promise<ImageAnalysisResult> {
+    try {
+      const visionClient = this.getVisionClient();
+      
+      // Convert image to base64
+      const base64Image = imageBuffer.toString('base64');
+      const dataUrl = `data:${mimeType};base64,${base64Image}`;
+
+      // Build prompt with surrounding text context
+      const prompt = buildImageAnalysisPrompt(surroundingText);
+
+      // Create message with image
+      const message = new HumanMessage({
+        content: [
+          {
+            type: 'text',
+            text: prompt,
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: dataUrl,
+            },
+          },
+        ],
+      });
+
+      const response = await visionClient.invoke([message]);
+      
+      // Extract text content from response
+      let content = response.content;
+      if (Array.isArray(content)) {
+        content = content
+          .map((c: any) => (typeof c === 'string' ? c : c?.text ?? ''))
+          .join('');
+      }
+      content = String(content || '');
+      
+      // Parse JSON response
+      try {
+        // Clean up potential markdown code blocks
+        const jsonStr = content
+          .replace(/^```json\s*/i, '')
+          .replace(/^```\s*/i, '')
+          .replace(/\s*```$/i, '')
+          .trim();
+        
+        const parsed = JSON.parse(jsonStr) as ImageAnalysisResult;
+        return {
+          description: parsed.description || '[No description]',
+          shouldEmbed: parsed.shouldEmbed ?? true, // Default to true if not specified
+          reason: parsed.reason || 'No reason provided',
+        };
+      } catch (parseErr) {
+        // If JSON parsing fails, treat as description-only (embed by default)
+        console.warn('Failed to parse VLM JSON response, using raw content as description');
+        return {
+          description: content || '[Image description unavailable]',
+          shouldEmbed: true,
+          reason: 'JSON parse failed, defaulting to embed',
+        };
+      }
+    } catch (err) {
+      console.error('Error analyzing image:', err);
+      return {
+        description: '[Image analysis unavailable]',
+        shouldEmbed: false,
+        reason: 'Analysis error',
+      };
+    }
+  }
+
+  /**
+   * Generate a description of an image using the vision model (legacy method)
+   * @deprecated Use analyzeImage instead for smarter filtering
+   */
+  async describeImage(imageBuffer: Buffer, mimeType: string): Promise<string> {
+    const result = await this.analyzeImage(imageBuffer, mimeType, '');
+    return result.description;
+  }
+
+  /**
+   * Interleave image descriptions into the page text
+   * Images are inserted at the end of the text with clear markers
+   */
+  private interleaveImagesIntoText(pageText: string, images: ExtractedImage[]): string {
+    if (images.length === 0) {
+      return pageText;
+    }
+
+    // Build the combined text with image descriptions
+    const parts: string[] = [pageText];
+
+    for (const img of images) {
+      const imageBlock = `
+
+[IMAGE:${img.imageId}]
+${img.description}
+[/IMAGE:${img.imageId}]
+`;
+      parts.push(imageBlock);
+    }
+
+    return parts.join('\n');
+  }
+}
+
+export const imageExtractionService = new ImageExtractionService();

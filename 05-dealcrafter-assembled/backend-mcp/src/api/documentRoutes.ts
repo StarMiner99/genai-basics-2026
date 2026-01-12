@@ -11,6 +11,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { getDocumentIngestionService } from '../services/documentIngestionService.js';
+import { imageStorageService } from '../services/imageStorageService.js';
 import { logInfo, logError } from '../utils/logger.js';
 import {
   createJob,
@@ -82,9 +83,15 @@ router.post('/upload', upload.array('files', 10), async (req: Request, res: Resp
         service
           .ingestDocument(newPath, perFileMetadata, tenantId, job.jobId)
           .then((result) => {
-            logInfo(
-              `Ingestion completed for ${file.originalname} (job ${job.jobId}) with ${result.chunks_created} chunks in ${Date.now() - startTime.getTime()} ms`
-            );
+            if (result.success) {
+              logInfo(
+                `Ingestion completed for ${file.originalname} (job ${job.jobId}) with ${result.chunks_created} chunks in ${Date.now() - startTime.getTime()} ms`
+              );
+            } else {
+              logError(
+                `Ingestion failed for ${file.originalname} (job ${job.jobId}) after ${Date.now() - startTime.getTime()} ms: ${result.error || 'Unknown error'}`
+              );
+            }
           })
           .catch((error) => {
             logError(`Failed to ingest ${file.originalname} (job ${job.jobId})`, error);
@@ -279,6 +286,122 @@ router.post('/search', async (req: Request, res: Response) => {
     });
   } catch (error) {
     logError('Document search failed', error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/**
+ * GET /api/documents/images/:imageId
+ * Retrieve an image by its ID (serves the binary image data)
+ */
+router.get('/images/:imageId', async (req: Request, res: Response) => {
+  const { imageId } = req.params;
+
+  if (!imageId) {
+    return res.status(400).json({
+      success: false,
+      error: 'imageId is required',
+    });
+  }
+
+  try {
+    const image = await imageStorageService.getImage(imageId);
+
+    if (!image) {
+      return res.status(404).json({
+        success: false,
+        error: `Image ${imageId} not found`,
+      });
+    }
+
+    // Set appropriate content type and cache headers
+    res.setHeader('Content-Type', image.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    res.setHeader('Content-Length', image.data.length);
+
+    return res.send(image.data);
+  } catch (error) {
+    logError(`Failed to retrieve image ${imageId}`, error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/**
+ * GET /api/documents/images/:imageId/metadata
+ * Retrieve image metadata (without binary data)
+ */
+router.get('/images/:imageId/metadata', async (req: Request, res: Response) => {
+  const { imageId } = req.params;
+
+  if (!imageId) {
+    return res.status(400).json({
+      success: false,
+      error: 'imageId is required',
+    });
+  }
+
+  try {
+    const metadata = await imageStorageService.getImageMetadata(imageId);
+
+    if (!metadata) {
+      return res.status(404).json({
+        success: false,
+        error: `Image ${imageId} not found`,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      image: metadata,
+    });
+  } catch (error) {
+    logError(`Failed to retrieve image metadata ${imageId}`, error);
+    return res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/**
+ * GET /api/documents/:documentId/images
+ * List all images for a specific document
+ */
+router.get('/:documentId/images', async (req: Request, res: Response) => {
+  const { documentId } = req.params;
+
+  if (!documentId) {
+    return res.status(400).json({
+      success: false,
+      error: 'documentId is required',
+    });
+  }
+
+  try {
+    const images = await imageStorageService.listImagesForDocument(documentId);
+
+    return res.status(200).json({
+      success: true,
+      document_id: documentId,
+      count: images.length,
+      images: images.map(img => ({
+        image_id: img.imageId,
+        page_number: img.pageNumber,
+        mime_type: img.mimeType,
+        width: img.width,
+        height: img.height,
+        description: img.description.slice(0, 200) + (img.description.length > 200 ? '...' : ''),
+        created_at: img.createdAt,
+      })),
+    });
+  } catch (error) {
+    logError(`Failed to list images for document ${documentId}`, error);
     return res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : String(error),

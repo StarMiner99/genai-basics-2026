@@ -9,7 +9,7 @@ interface ThemeSelectorProps {
   onClose: () => void;
 }
 
-export function ThemeSelector({ onClose }: ThemeSelectorProps) {
+export function ThemeSelector({ onClose: _onClose }: ThemeSelectorProps) {
   const { themeMode, setThemeMode } = useTheme();
 
   const handleThemeChange = (mode: ThemeMode) => {
