@@ -1,14 +1,14 @@
-# Part 3: The Analyst Workflow
+# Part 3: The Analyst Workflow with MCP Integration
 
-> **Goal:** Orchestrate complex multi-step analysis using LangGraph.
+> **Goal:** Orchestrate complex multi-step analysis using LangGraph and MCP tools.
 
 ---
 
 ## 🎯 What You'll Build
 
-A **LangGraph workflow** that chains together multiple analysis steps:
-1. **Fetch Stock** → Get current stock data
-2. **Search News** → Find recent market news
+A **LangGraph workflow** that chains together multiple analysis steps using **MCP (Model Context Protocol) tools**:
+1. **Fetch Stock** → Get current stock data via MCP tools
+2. **Search News** → Find recent market news via MCP tools
 3. **Retrieve Docs** → Query ingested PDFs via RAG
 4. **Analyze** → Generate a comprehensive analysis
 
@@ -67,8 +67,8 @@ uv run python analyst_agent.py
 - Main execution loop
 
 ### What You Implement
-- `fetch_stock_node()` – Call yfinance
-- `search_news_node()` – Call Perplexity
+- `fetch_stock_node()` – Connect to MCP server and call stock tools
+- `search_news_node()` – Connect to MCP server and call news tools
 - `retrieve_docs_node()` – Query HANA vector store
 - `analyze_node()` – Craft prompt and call LLM
 
@@ -78,16 +78,18 @@ uv run python analyst_agent.py
 
 ### Exercise 3a: `fetch_stock_node`
 ```python
-def fetch_stock_node(state: AnalystState) -> dict:
-    # TODO: Use yfinance to get stock info for state["ticker"]
+async def fetch_stock_node(state: AnalystState) -> dict:
+    # TODO: Connect to MCP server from 02-data-connector-mcp
+    # TODO: Use get_stock_info tool with state["ticker"]
     # Return: {"stock_info": {...}}
 ```
 
 ### Exercise 3b: `search_news_node`
 ```python
-def search_news_node(state: AnalystState) -> dict:
-    # TODO: Use Perplexity to search news about state["company_name"]
-    # Return: {"news_results": [...]}
+async def search_news_node(state: AnalystState) -> dict:
+    # TODO: Connect to MCP server from 02-data-connector-mcp
+    # TODO: Use search_market_news tool with company name
+    # Return: {"news_results": "..."}
 ```
 
 ### Exercise 3c: `retrieve_docs_node`
@@ -107,6 +109,38 @@ def analyze_node(state: AnalystState) -> dict:
 
 ---
 
+## 🔌 MCP Integration
+
+This module integrates with the **Model Context Protocol (MCP)** to access tools from the `02-data-connector-mcp` module:
+
+### MCP Tools Used
+- **`get_stock_info(ticker)`** - Fetches current stock data using yfinance
+- **`search_market_news(query, limit)`** - Searches recent news using Perplexity AI
+
+### MCP Connection Pattern
+```python
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from langchain_mcp_adapters.tools import load_mcp_tools
+
+# Connect to MCP server
+server_params = StdioServerParameters(
+    command=sys.executable,
+    args=[str(Path(__file__).parent.parent / "02-data-connector-mcp" / "mcp_server.py")],
+)
+
+async with stdio_client(server_params) as (read, write):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        tools = await load_mcp_tools(session)
+        
+        # Use tools
+        stock_tool = next(tool for tool in tools if tool.name == "get_stock_info")
+        result = await stock_tool.ainvoke({"ticker": "3778.T"})
+```
+
+---
+
 ## 💡 Key Concepts
 
 ### LangGraph State
@@ -116,7 +150,7 @@ class AnalystState(TypedDict):
     ticker: str
     query: str
     stock_info: dict
-    news_results: list[dict]
+    news_results: str  # Changed to string for MCP integration
     doc_context: str
     analysis: str
 ```

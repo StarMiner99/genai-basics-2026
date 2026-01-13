@@ -1,13 +1,15 @@
-"""Part 3: LangGraph Analyst Workflow
+"""Part 3: LangGraph Analyst Workflow with MCP Integration
 
 This script implements a multi-step analysis workflow using LangGraph.
-The graph structure is provided - you implement the node logic.
+The graph structure is provided - you implement the node logic using MCP tools.
 
 Run with:
     uv run python analyst_agent.py
 """
 
+import asyncio
 import os
+import sys
 from pathlib import Path
 from typing_extensions import TypedDict
 
@@ -48,66 +50,88 @@ class AnalystState(TypedDict):
 # NODE IMPLEMENTATIONS (EXERCISES - IMPLEMENT THESE)
 # =============================================================================
 
-def fetch_stock_node(state: AnalystState) -> dict:
-    """EXERCISE 3a: Fetch stock data using yfinance.
+async def fetch_stock_node(state: AnalystState) -> dict:
+    """EXERCISE 3a: Fetch stock data using MCP tools.
     
     TODO:
-    1. Import yfinance
-    2. Get stock info for state["ticker"]
+    1. Connect to MCP server and get stock tool
+    2. Use the get_stock_info tool with state["ticker"]
     3. Return {"stock_info": {...}, "step_count": state["step_count"] + 1}
     """
     print(f"📊 Step 1: Fetching stock data for {state['ticker']}...")
     
     # ==========================================================================
-    # TODO: Import yfinance
-    # Hint: import yfinance as yf
+    # TODO: Import MCP client components
+    # Hint: from mcp import ClientSession, StdioServerParameters
+    # Hint: from mcp.client.stdio import stdio_client
+    # Hint: from langchain_mcp_adapters.tools import load_mcp_tools
     #
-    # TODO: Get stock info
-    # Hint: stock = yf.Ticker(state["ticker"])
-    # Hint: info = stock.info
+    # TODO: Configure MCP server connection
+    # Hint: server_params = StdioServerParameters(
+    #     command=sys.executable,
+    #     args=[str(Path(__file__).parent.parent / "02-data-connector-mcp" / "mcp_server.py")],
+    # )
     #
-    # TODO: Build stock_info dict
-    # Hint: stock_info = {
-    #     "price": info.get("currentPrice") or info.get("regularMarketPrice"),
-    #     "currency": info.get("currency", "JPY"),
-    #     "change_percent": info.get("regularMarketChangePercent"),
-    #     "market_cap": info.get("marketCap"),
-    #     "pe_ratio": info.get("trailingPE"),
-    # }
+    # TODO: Connect to MCP server and load tools
+    # Hint: async with stdio_client(server_params) as (read, write):
+    # Hint:     async with ClientSession(read, write) as session:
+    # Hint:         await session.initialize()
+    # Hint:         tools = await load_mcp_tools(session)
     #
-    # TODO: Print and return
-    # Hint: print(f"   ✅ Price: {stock_info['currency']}{stock_info['price']}")
+    # TODO: Find and use stock tool
+    # Hint: stock_tool = next(tool for tool in tools if tool.name == "get_stock_info")
+    # Hint: result = await stock_tool.ainvoke({"ticker": state["ticker"]})
+    #
+    # TODO: Process result and return
+    # Hint: stock_info = result if isinstance(result, dict) else {"error": "Failed to get stock data"}
+    # Hint: if "price" in stock_info and "currency" in stock_info:
+    # Hint:     print(f"   ✅ Price: {stock_info['currency']}{stock_info['price']}")
     # Hint: return {"stock_info": stock_info, "step_count": state["step_count"] + 1}
     # ==========================================================================
     
-    raise NotImplementedError("Exercise 3a: Implement fetch_stock_node")
+    raise NotImplementedError("Exercise 3a: Implement fetch_stock_node with MCP")
 
 
-def search_news_node(state: AnalystState) -> dict:
-    """EXERCISE 3b: Search for market news using Perplexity.
+async def search_news_node(state: AnalystState) -> dict:
+    """EXERCISE 3b: Search for market news using MCP tools.
     
     TODO:
-    1. Initialize Perplexity LLM
-    2. Search for news about the company
+    1. Connect to MCP server and get news search tool
+    2. Use the search_market_news tool with company name
     3. Return {"news_results": "...", "step_count": ...}
     """
     print(f"📰 Step 2: Searching news for {state['company_name']}...")
     
     # ==========================================================================
-    # TODO: Import and initialize Perplexity
-    # Hint: from gen_ai_hub.proxy.langchain.init_models import init_llm
-    # Hint: perplexity = init_llm(PERPLEXITY_MODEL, max_tokens=2000)
+    # TODO: Import MCP client components (if not already imported)
+    # Hint: from mcp import ClientSession, StdioServerParameters
+    # Hint: from mcp.client.stdio import stdio_client
+    # Hint: from langchain_mcp_adapters.tools import load_mcp_tools
     #
-    # TODO: Create search prompt
-    # Hint: prompt = f"Search for the 5 most recent news articles about {state['company_name']}..."
+    # TODO: Configure MCP server connection
+    # Hint: server_params = StdioServerParameters(
+    #     command=sys.executable,
+    #     args=[str(Path(__file__).parent.parent / "02-data-connector-mcp" / "mcp_server.py")],
+    # )
     #
-    # TODO: Invoke and return
-    # Hint: response = perplexity.invoke(prompt)
+    # TODO: Connect to MCP server and load tools
+    # Hint: async with stdio_client(server_params) as (read, write):
+    # Hint:     async with ClientSession(read, write) as session:
+    # Hint:         await session.initialize()
+    # Hint:         tools = await load_mcp_tools(session)
+    #
+    # TODO: Find and use news search tool
+    # Hint: news_tool = next(tool for tool in tools if tool.name == "search_market_news")
+    # Hint: query = f"{state['company_name']} financial news investment analysis"
+    # Hint: result = await news_tool.ainvoke({"query": query, "limit": 5})
+    #
+    # TODO: Process result and return
+    # Hint: news_results = result if isinstance(result, str) else "No news found"
     # Hint: print(f"   ✅ Found news articles")
-    # Hint: return {"news_results": response.content, "step_count": state["step_count"] + 1}
+    # Hint: return {"news_results": news_results, "step_count": state["step_count"] + 1}
     # ==========================================================================
     
-    raise NotImplementedError("Exercise 3b: Implement search_news_node")
+    raise NotImplementedError("Exercise 3b: Implement search_news_node with MCP")
 
 
 def retrieve_docs_node(state: AnalystState) -> dict:
@@ -222,7 +246,7 @@ agent = agent_builder.compile()
 # MAIN EXECUTION (PROVIDED - DO NOT MODIFY)
 # =============================================================================
 
-def main():
+async def main():
     """Run the analyst workflow."""
     
     print(f"\n🔄 Starting analyst workflow for {COMPANY_NAME} ({TICKER})")
@@ -236,8 +260,8 @@ def main():
     
     print()
     
-    # Run the workflow
-    result = agent.invoke({
+    # Run the workflow (using async invoke)
+    result = await agent.ainvoke({
         "company_name": COMPANY_NAME,
         "ticker": TICKER,
         "query": query,
@@ -256,4 +280,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
