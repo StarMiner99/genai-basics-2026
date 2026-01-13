@@ -52,16 +52,26 @@ class AnalystState(TypedDict):
 
 def get_hana_connection():
     """Create a connection to SAP HANA Cloud."""
-# Hint: from hdbcli import dbapi
-# Hint:
-#     return dbapi.connect(
-#         address=os.getenv("HANA_DB_ADDRESS"),
-#         port=int(os.getenv("HANA_DB_PORT", "443")),
-#         user=os.getenv("HANA_DB_USER"),
-#         password=os.getenv("HANA_DB_PASSWORD"),
-#         autocommit=True,
-#         sslValidateCertificate=False,
-#     )
+    # Hint: from hdbcli import dbapi
+    # Validate required environment variables
+    # address = os.getenv("HANA_DB_ADDRESS")
+    # user = os.getenv("HANA_DB_USER")
+    # password = os.getenv("HANA_DB_PASSWORD")
+    
+    # if not address:
+    #     raise ValueError("HANA_DB_ADDRESS environment variable is required")
+    # if not user:
+    #     raise ValueError("HANA_DB_USER environment variable is required")
+    # if not password:
+    #     raise ValueError("HANA_DB_PASSWORD environment variable is required")
+    
+    # return dbapi.connect(
+    #     address=address,
+    #     port=int(os.getenv("HANA_DB_PORT", "443")),
+    #     user=user,
+    #     password=password,
+    #     autocommit=True,
+    # )
 
 
 async def _async_get_stock_info(ticker: str) -> dict:
